@@ -1,68 +1,67 @@
-# GONIM-CORE SSA Lowering Demonstration
+# GONIM-CORE SSA Lowering (Detailed)
 
-## Example 1: Tuple Extraction
+## Tuple Extraction (`extract`)
 
 Go SSA:
 ```
 t0 = call someFunc()
 t1 = extract t0, 0
-t2 = extract t0, 1
 ```
 
-Nim Translation:
+Lowering Strategy:
+Go multi-value returns are lowered to Nim tuples.
 ```nim
 let t0 = someFunc()
 let t1 = t0[0]
-let t2 = t0[1]
 ```
 
-### Decision Logic
-Go SSA `extract` instructions operate on multi-value returns (tuples). Nim natively supports tuples and indexing. GONIM-CORE maps Go multi-value returns directly to Nim tuples to maintain zero-cost lowering and bit-level compatibility.
-
-## Example 2: Control Flow (Blocks)
+## PHI Nodes
 
 Go SSA:
 ```
-b0:
-  t0 = x < y
-  if t0 goto b1 else b2
 b1:
-  return x
+  t0 = ...
+  jump b3
 b2:
-  return y
+  t1 = ...
+  jump b3
+b3:
+  t2 = phi [b1: t0, b2: t1]
 ```
 
-Nim Translation:
+Lowering Strategy:
+Nim does not have native PHI nodes. We use "variable lifting".
 ```nim
-# Lowered as structured if-else
-if x < y:
-  return x
-else:
-  return y
+var t2: T # Lifted
+# ... logic in b1
+t2 = t0
+goto b3
+# ... logic in b2
+t2 = t1
+goto b3
 ```
 
-### Decision Logic
-Go SSA is a graph of basic blocks. GONIM-CORE uses Nim's `block` and `label` (if needed) to reconstruct the control flow graph. For simple if-else, it promotes blocks to structured Nim `if` statements when possible. Complex graphs with loops are lowered using a `while true` loop with a state-machine or Nim's `label`/`goto`.
-
-## Example 3: Implicit Pointer Conversions
-
-Go:
-```go
-var x int
-var p *int = &x
-```
+## Interface Dispatch
 
 Go SSA:
 ```
-t0 = local int (x)
-t1 = &t0
+t1 = invoke t0.Greet()
 ```
 
-Nim Translation:
+Lowering Strategy:
 ```nim
-var t0: int64
-let t1 = addr t0
+# Fat pointer dispatch
+type VTable = object
+  Greet: proc(data: pointer) {.nimcall.}
+
+let vt = cast[ptr VTable](t0.typeinfo.vtable)
+vt.Greet(t0.data)
 ```
 
-### Decision Logic
-Go's `local` allocations are lowered to Nim `var` declarations. The address-of operator `&` maps to Nim's `addr`. GONIM-CORE tracks address-taken variables to ensure they are not optimized away or incorrectly moved to registers.
+## Memory Layout (Bit-level)
+
+GONIM-CORE ensures that `struct` fields in Go match Nim `object` fields exactly by using `{.packed.}` where necessary and aligning with Go's alignment rules.
+- `int64` -> `int64`
+- `*int` -> `ptr int64`
+- `string` -> `GoString` (16 bytes on 64-bit)
+- `[]T` -> `GoSlice[T]` (24 bytes on 64-bit)

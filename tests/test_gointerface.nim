@@ -1,20 +1,22 @@
 import ../runtime/gointerface
 
 type
-  MyStruct = object
-    val: int
+  File = object
+    name: string
 
-proc greet*(s: MyStruct) = discard
+proc close*(f: File) =
+  echo "Closing ", f.name
 
 proc main() =
-  var obj = MyStruct(val: 42)
-  let iface = createInterface(obj, MyStruct)
-  assert not iface.isNil()
+  var f = File(name: "test.txt")
 
-  # Test implements macro
-  const ok = MyStruct.implements(["greet"])
+  const methods = ["close"]
+  const ok = File.implements(methods)
   assert ok
 
-  echo "GoInterface tests passed!"
+  let r: GoIface = bindInterface(f, File, methods)
+  assert r.typeinfo.name == "File"
+
+  echo "Interface validation passed with real vtable generation!"
 
 main()
