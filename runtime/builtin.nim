@@ -10,8 +10,6 @@ type
   GoMap*[K, V] = ref Table[K, V]
 
   GoChan*[T] = ref object
-    # In production, this would be a channel with Go semantics
-    # (capacity, blocking, etc.)
     dummy: int
 
   GoError* = GoIface
@@ -29,6 +27,7 @@ proc makeMap*[K, V](): GoMap[K, V] =
 proc panic*(msg: string) =
   raise newException(CatchableError, "panic: " & msg)
 
-# --- Standard Interface for error ---
-# type error interface { Error() string }
-# In Go, the error interface is just a method set.
+proc println*(args: varargs[string, `$`]) =
+  for arg in args:
+    stdout.write arg
+  stdout.write "\n"

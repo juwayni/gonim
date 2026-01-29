@@ -1,12 +1,8 @@
 # runtime/goslice.nim
 
 type
-  GoSliceStorage = object
-    refCount: int
-    capacity: int
-
-type
   GoSlice*[T] = object
+    # EXACT bit-layout compatibility with Go (24 bytes on 64-bit)
     data*: ptr UncheckedArray[T]
     len*: int
     cap*: int
@@ -32,13 +28,8 @@ proc grow[T](s: GoSlice[T], n: int): GoSlice[T] =
   let target = s.len + n
   let newCap = nextSliceCap(target, s.cap)
 
-  let storageSize = sizeof(GoSliceStorage) + (sizeof(T) * newCap)
-  let raw = allocShared0(storageSize)
-  let newData = cast[ptr UncheckedArray[T]](cast[uint](raw) + cast[uint](sizeof(GoSliceStorage)))
-
-  let header = cast[ptr GoSliceStorage](raw)
-  header.refCount = 1
-  header.capacity = newCap
+  # In production, this would use a GC-aware allocator
+  let newData = cast[ptr UncheckedArray[T]](allocShared0(sizeof(T) * newCap))
 
   if s.data != nil:
     copyMem(newData, s.data, sizeof(T) * s.len)
