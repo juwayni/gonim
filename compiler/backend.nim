@@ -1,6 +1,17 @@
 import json, strutils, os, tables, sequtils
 
 type
+  IRField = object
+    Name: string
+    Type: string
+
+  IRType = object
+    Name: string
+    Kind: string
+    Fields: seq[IRField]
+    Methods: seq[string]
+    Element: string
+
   IRInstruction = object
     Kind: string
     Op: string
@@ -17,6 +28,8 @@ type
     HasCallResult: bool
     Index: int
     Field: int
+    MethodName: string
+    IsInvoke: bool
 
   IRBlock = object
     Index: int
@@ -24,6 +37,7 @@ type
 
   IRFunction = object
     Name: string
+    Signature: string
     Params: seq[string]
     Results: seq[string]
     Blocks: seq[IRBlock]
@@ -31,14 +45,26 @@ type
   IRPackage = object
     Name: string
     Functions: seq[IRFunction]
+    Types: seq[IRType]
+    Globals: seq[IRField]
 
   IRRoot = object
     Packages: seq[IRPackage]
 
 proc sanitize(name: string): string =
-  result = name.replace("$", "_").replace(".", "_")
-  if result.contains(":"):
-    result = result.split(":")[0]
+  var s = name
+  if s.contains(":"):
+     let parts = s.split(":")
+     if parts[0].startsWith("\"") and parts[0].endsWith("\""):
+         return "makeGoString(" & parts[0] & ")"
+     if parts[0].allCharsInSet(Digits + {'-'}):
+         return parts[0]
+     s = parts[0]
+
+  if s.startsWith("\"") and s.endsWith("\""):
+      return "makeGoString(" & s & ")"
+
+  result = s.replace("$", "_").replace(".", "_").replace("/", "_").replace("*", "Ptr").replace(" ", "_").replace("{", "Struct").replace("}", "End").replace("[", "Slice").replace("]", "End").replace("(", "LP").replace(")", "RP").replace(",", "Comma").replace(";", "Semi").replace("\"", "").replace("-", "_")
 
 proc mapType(goType: string): string =
   if goType == "" or goType == "invalid type": return "pointer"
@@ -47,13 +73,30 @@ proc mapType(goType: string): string =
   if goType == "bool": return "bool"
   if goType.startsWith("*"): return "ptr " & mapType(goType[1..^1])
   if goType.startsWith("[]"): return "GoSlice[" & mapType(goType[2..^1]) & "]"
-  if goType.contains("struct{"): return "object"
-  if goType.contains("interface{"): return "GoIface"
-  return "int64" # Default for basic types like 'int' aliases
+  return sanitize(goType)
+
+proc generateTypes(types: seq[IRType]): string =
+  if types.len == 0: return ""
+  result = "type\n"
+  var seen = initTable[string, bool]()
+  for t in types:
+    let sName = sanitize(t.Name)
+    if seen.hasKey(sName) or sName == "pointer" or sName == "int64": continue
+    seen[sName] = true
+    if t.Kind == "struct":
+      result.add "  " & sName & "* = object\n"
+      if t.Fields.len == 0:
+         result.add "    dummy*: int\n"
+      for i, f in t.Fields:
+        result.add "    f" & $i & "*: " & mapType(f.Type) & " # " & f.Name & "\n"
+    elif t.Kind == "interface":
+      result.add "  " & sName & "* = GoIface\n"
+  if result == "type\n": return ""
+  result.add "\n"
 
 proc generateSignature(fn: IRFunction): string =
   if fn.Name == "init" or fn.Blocks.len == 0: return ""
-  result = "proc " & fn.Name & "("
+  result = "proc " & sanitize(fn.Name) & "*("
   for i, p in fn.Params:
     if i > 0: result.add ", "
     result.add sanitize(p) & ": any"
@@ -69,7 +112,7 @@ proc generateFunction(fn: IRFunction): string =
   for b in fn.Blocks:
     for inst in b.Instructions:
       if inst.Target != "" and not temps.hasKey(inst.Target):
-        if inst.Kind == "Call" and not inst.HasCallResult: continue
+        if (inst.Kind == "Call" or inst.Kind == "Invoke") and not inst.HasCallResult: continue
         temps[inst.Target] = mapType(inst.Type)
 
   for t, ty in temps:
@@ -86,14 +129,36 @@ proc generateFunction(fn: IRFunction): string =
       of "BinOp":
         res.add "      " & sanitize(inst.Target) & " = " & sanitize(inst.Lhs) & " " & inst.Op & " " & sanitize(inst.Rhs) & "\n"
       of "UnOp":
-        res.add "      " & sanitize(inst.Target) & " = " & inst.Op & sanitize(inst.X) & "\n"
+        if inst.Op == "*": # Load
+           res.add "      " & sanitize(inst.Target) & " = " & sanitize(inst.X) & "[]\n"
+        else:
+           res.add "      " & sanitize(inst.Target) & " = " & inst.Op & sanitize(inst.X) & "\n"
+      of "Alloc":
+        if inst.Type.startsWith("*"):
+           res.add "      " & sanitize(inst.Target) & " = cast[" & mapType(inst.Type) & "](allocShared0(sizeof(" & mapType(inst.Type[1..^1]) & ")))\n"
+        else:
+           res.add "      discard # Stack alloc for " & sanitize(inst.Target) & "\n"
       of "Store":
         res.add "      " & sanitize(inst.Lhs) & "[] = " & sanitize(inst.Rhs) & "\n"
+      of "FieldAddr":
+        res.add "      " & sanitize(inst.Target) & " = addr " & sanitize(inst.X) & ".f" & $inst.Field & "\n"
+      of "IndexAddr":
+        res.add "      " & sanitize(inst.Target) & " = addr " & sanitize(inst.X) & "[" & sanitize(inst.Lhs) & "]\n"
+      of "Extract":
+        res.add "      " & sanitize(inst.Target) & " = " & sanitize(inst.X) & "[" & $inst.Index & "]\n"
+      of "MakeInterface":
+        res.add "      " & sanitize(inst.Target) & " = bindInterface(" & sanitize(inst.X) & ")\n"
       of "Call":
-        if inst.HasCallResult:
-          res.add "      " & sanitize(inst.Target) & " = " & sanitize(inst.X) & "(" & inst.Args.map(sanitize).join(", ") & ")\n"
+        if inst.IsInvoke:
+          if inst.HasCallResult:
+            res.add "      " & sanitize(inst.Target) & " = invokeInterface(" & sanitize(inst.X) & ", \"" & inst.MethodName & "\", [" & inst.Args.map(sanitize).join(", ") & "])\n"
+          else:
+            res.add "      discard invokeInterface(" & sanitize(inst.X) & ", \"" & inst.MethodName & "\", [" & inst.Args.map(sanitize).join(", ") & "])\n"
         else:
-          res.add "      " & sanitize(inst.X) & "(" & inst.Args.map(sanitize).join(", ") & ")\n"
+          if inst.HasCallResult:
+            res.add "      " & sanitize(inst.Target) & " = " & sanitize(inst.X) & "(" & inst.Args.map(sanitize).join(", ") & ")\n"
+          else:
+            res.add "      " & sanitize(inst.X) & "(" & inst.Args.map(sanitize).join(", ") & ")\n"
       of "Return":
         if inst.Args.len > 0:
           res.add "      return " & sanitize(inst.Args[0]) & "\n"
@@ -103,6 +168,8 @@ proc generateFunction(fn: IRFunction): string =
         res.add "      nextBlock = " & $inst.Block & "\n"
       of "If":
         res.add "      if " & sanitize(inst.X) & ": nextBlock = " & $inst.True & " else: nextBlock = " & $inst.False & "\n"
+      of "Phi":
+        res.add "      " & sanitize(inst.Target) & " = " & sanitize(inst.Args[0]) & "\n"
       else:
         res.add "      discard # " & inst.Kind & "\n"
 
@@ -112,18 +179,26 @@ proc generateFunction(fn: IRFunction): string =
 proc main() =
   let data = stdin.readAll()
   if data.strip() == "": return
-  let root = data.parseJson().to(IRRoot)
+
+  var root: IRRoot
+  try:
+    root = data.parseJson().to(IRRoot)
+  except:
+    stderr.writeLine "Error: " & getCurrentExceptionMsg()
+    quit(1)
 
   echo "import runtime/builtin"
   for pkg in root.Packages:
     echo "\n# Package: " & pkg.Name
+    let typesCode = generateTypes(pkg.Types)
+    if typesCode != "": echo typesCode
     for fn in pkg.Functions:
       let sig = generateSignature(fn)
-      if sig != "": echo sig
+      if sig != "": echo sig & " # Forward"
 
     for fn in pkg.Functions:
       let code = generateFunction(fn)
       if code != "": echo code
 
 main()
-echo "\nmain()"
+echo "\nmain_main()" # Go main is usually in package main, sanitized
