@@ -14,10 +14,10 @@ import (
 
 type IRType struct {
 	Name    string
-	Kind    string
-	Fields  []IRField
-	Methods []string
-	Element string
+	Kind    string // struct, interface, pointer, slice, basic, array
+	Fields  []IRField `json:",omitempty"`
+	Methods []string  `json:",omitempty"`
+	Element string    `json:",omitempty"` // for pointers, slices, arrays
 }
 
 type IRField struct {
@@ -27,22 +27,22 @@ type IRField struct {
 
 type IRInstruction struct {
 	Kind          string
-	Op            string
-	Target        string
-	Lhs           string
-	Rhs           string
-	X             string
-	Args          []string
-	Type          string
-	Val           string
-	Block         int
-	True          int
-	False         int
-	Index         int
-	Field         int
-	HasCallResult bool
-	MethodName    string
-	IsInvoke      bool
+	Op            string   `json:",omitempty"`
+	Target        string   `json:",omitempty"`
+	Lhs           string   `json:",omitempty"`
+	Rhs           string   `json:",omitempty"`
+	X             string   `json:",omitempty"`
+	Args          []string `json:",omitempty"`
+	Type          string   `json:",omitempty"`
+	Val           string   `json:",omitempty"`
+	Block         int      `json:",omitempty"`
+	True          int      `json:",omitempty"`
+	False         int      `json:",omitempty"`
+	Index         int      `json:",omitempty"`
+	Field         int      `json:",omitempty"`
+	HasCallResult bool     `json:",omitempty"`
+	MethodName    string   `json:",omitempty"`
+	IsInvoke      bool     `json:",omitempty"`
 }
 
 type IRBlock struct {
@@ -60,9 +60,11 @@ type IRFunction struct {
 
 type IRPackage struct {
 	Name      string
+	Path      string
 	Functions []IRFunction
 	Types     []IRType
 	Globals   []IRField
+	ASMFiles  []string
 }
 
 type IRRoot struct {
@@ -113,6 +115,14 @@ func registerType(t types.Type) {
 		it.Kind = "array"
 		it.Element = v.Elem().String()
 		registerType(v.Elem())
+	case *types.Chan:
+		it.Kind = "chan"
+		it.Element = v.Elem().String()
+		registerType(v.Elem())
+	case *types.Map:
+		it.Kind = "map"
+		registerType(v.Key())
+		registerType(v.Elem())
 	default:
 		it.Kind = "basic"
 	}
@@ -124,8 +134,10 @@ func main() {
 		log.Fatal("Usage: gonim-frontend <package>")
 	}
 
-	cfg := &packages.Config{Mode: packages.LoadAllSyntax}
-	pkgs, err := packages.Load(cfg, os.Args[1])
+	cfg := &packages.Config{
+		Mode: packages.LoadAllSyntax,
+	}
+	pkgs, err := packages.Load(cfg, os.Args[1:]...)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -139,17 +151,29 @@ func main() {
 		if p == nil {
 			continue
 		}
+		path := p.Pkg.Path()
+		if path == "unsafe" {
+			continue
+		}
+
 		irPkg := IRPackage{
 			Name:      p.Pkg.Name(),
+			Path:      path,
 			Functions: make([]IRFunction, 0),
 			Types:     make([]IRType, 0),
 			Globals:   make([]IRField, 0),
+			ASMFiles:  make([]string, 0),
+		}
+
+		allFuncs := ssautil.AllFunctions(prog)
+		for fn := range allFuncs {
+			if fn.Package() == p {
+				irPkg.Functions = append(irPkg.Functions, lowerFunction(fn))
+			}
 		}
 
 		for _, m := range p.Members {
 			switch v := m.(type) {
-			case *ssa.Function:
-				irPkg.Functions = append(irPkg.Functions, lowerFunction(v))
 			case *ssa.Global:
 				irPkg.Globals = append(irPkg.Globals, IRField{Name: v.Name(), Type: v.Type().String()})
 				registerType(v.Type())
@@ -168,7 +192,7 @@ func main() {
 
 func lowerFunction(fn *ssa.Function) IRFunction {
 	irFn := IRFunction{
-		Name:      fn.Name(),
+		Name:      fn.String(),
 		Signature: fn.Signature.String(),
 		Params:    make([]string, 0),
 		Results:   make([]string, 0),
@@ -223,12 +247,30 @@ func lowerInstruction(inst ssa.Instruction) IRInstruction {
 		ir.Lhs = v.Addr.Name()
 		ir.Rhs = v.Val.Name()
 	case *ssa.Call:
-		ir.X = v.Call.Value.Name()
+		ir.X = v.Call.Value.String()
 		for _, arg := range v.Call.Args {
 			ir.Args = append(ir.Args, arg.Name())
 		}
 		if v.Name() != "" && v.Type().String() != "()" {
 			ir.HasCallResult = true
+		}
+		if v.Call.IsInvoke() {
+			ir.IsInvoke = true
+			ir.MethodName = v.Call.Method.Name()
+		}
+	case *ssa.Defer:
+		ir.X = v.Call.Value.String()
+		for _, arg := range v.Call.Args {
+			ir.Args = append(ir.Args, arg.Name())
+		}
+		if v.Call.IsInvoke() {
+			ir.IsInvoke = true
+			ir.MethodName = v.Call.Method.Name()
+		}
+	case *ssa.Go:
+		ir.X = v.Call.Value.String()
+		for _, arg := range v.Call.Args {
+			ir.Args = append(ir.Args, arg.Name())
 		}
 		if v.Call.IsInvoke() {
 			ir.IsInvoke = true
@@ -269,6 +311,15 @@ func lowerInstruction(inst ssa.Instruction) IRInstruction {
 		ir.X = v.X.Name()
 		ir.Type = v.AssertedType.String()
 		registerType(v.AssertedType)
+	case *ssa.MakeClosure:
+		ir.X = v.Fn.String()
+		for _, binding := range v.Bindings {
+			ir.Args = append(ir.Args, binding.Name())
+		}
+	case *ssa.Select:
+		for _, state := range v.States {
+			ir.Args = append(ir.Args, state.Chan.Name())
+		}
 	}
 	return ir
 }

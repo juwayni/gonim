@@ -48,24 +48,19 @@ type
     Functions: seq[IRFunction]
     Types: seq[IRType]
     Globals: seq[IRField]
+    ASMFiles: seq[string]
 
   IRRoot = object
     Packages: seq[IRPackage]
 
-var currentPkgPrefix = ""
-
 proc sanitize(name: string): string =
   if name.startsWith("\"") and name.endsWith("\""): return "makeGoString(" & name & ")"
-
   var s = name
   if s.contains(":"):
      let parts = s.split(":")
      if parts[0].allCharsInSet(Digits + {'-'}): return parts[0]
      s = parts[0]
-
-  result = s.replace("$", "_").replace(".", "_").replace("/", "_").replace("*", "Ptr").replace(" ", "_").replace("{", "Struct").replace("}", "End").replace("[", "Slice").replace("]", "End").replace("(", "LP").replace(")", "RP").replace(",", "Comma").replace(";", "Semi").replace("\"", "").replace("-", "_").replace(":", "_")
-
-  if result == "init_guard": result = currentPkgPrefix & "_init_guard"
+  result = s.replace("$", "_").replace(".", "_").replace("/", "_").replace("*", "Ptr").replace(" ", "_").replace("{", "Struct").replace("}", "End").replace("[", "Slice").replace("]", "End").replace("(", "LP").replace(")", "RP").replace(",", "Comma").replace(";", "Semi").replace("\"", "").replace("-", "_").replace(":", "_").replace("|", "Pipe").replace("&", "Amp")
 
 proc mapType(goType: string): string =
   if goType == "" or goType == "invalid type": return "pointer"
@@ -75,7 +70,6 @@ proc mapType(goType: string): string =
   if goType.startsWith("*"): return "ptr " & mapType(goType[1..^1])
   if goType.startsWith("[]"):
      let inner = goType[2..^1]
-     if inner == "any" or inner == "interface{}": return "GoSlice[GoIface]"
      return "GoSlice[" & mapType(inner) & "]"
   if goType == "any" or goType == "interface{}": return "GoIface"
   return sanitize(goType)
@@ -147,6 +141,7 @@ proc generateFunction(fn: IRFunction): string =
       of "Defer": res.add "      pushDefer(proc() = discard " & sanitize(inst.X) & "(" & inst.Args.map(sanitize).join(", ") & "))\n"
       of "Go": res.add "      spawn " & sanitize(inst.X) & "(" & inst.Args.map(sanitize).join(", ") & ")\n"
       of "RunDefers": res.add "      runDefers()\n"
+      of "MakeClosure": res.add "      " & sanitize(inst.Target) & " = makeClosure(" & sanitize(inst.X) & ", [" & inst.Args.map(sanitize).join(", ") & "])\n"
       else: res.add "      discard # " & inst.Kind & "\n"
   res.add "    else: break\n"
   return res
@@ -156,6 +151,10 @@ proc main() =
   if data.strip() == "": return
   let root = data.parseJson().to(IRRoot)
   echo "import runtime/builtin, runtime/stdlib_mapping, threadpool"
+
+  for pkg in root.Packages:
+    for asm in pkg.ASMFiles:
+       echo "{.link: \"" & asm & ".o\".}"
 
   for pkg in root.Packages:
     echo generateTypes(pkg.Types)
@@ -169,11 +168,9 @@ proc main() =
     if pkg.Globals.len > 0:
       echo "var"
       for g in pkg.Globals:
-        currentPkgPrefix = pkg.Name.replace("-", "_")
         echo "  " & sanitize(g.Name) & "*: " & mapType(g.Type)
 
   for pkg in root.Packages:
-    currentPkgPrefix = pkg.Name.replace("-", "_")
     for fn in pkg.Functions:
       let code = generateFunction(fn)
       if code != "": echo code
