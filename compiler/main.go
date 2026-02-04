@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/token"
 	"go/types"
 	"log"
 	"os"
@@ -14,10 +16,10 @@ import (
 
 type IRType struct {
 	Name    string
-	Kind    string // struct, interface, pointer, slice, basic, array
+	Kind    string
 	Fields  []IRField `json:",omitempty"`
 	Methods []string  `json:",omitempty"`
-	Element string    `json:",omitempty"` // for pointers, slices, arrays
+	Element string    `json:",omitempty"`
 }
 
 type IRField struct {
@@ -43,6 +45,7 @@ type IRInstruction struct {
 	HasCallResult bool     `json:",omitempty"`
 	MethodName    string   `json:",omitempty"`
 	IsInvoke      bool     `json:",omitempty"`
+	SourcePos     string   `json:",omitempty"`
 }
 
 type IRBlock struct {
@@ -56,6 +59,8 @@ type IRFunction struct {
 	Params    []string
 	Results   []string
 	Blocks    []IRBlock
+	IsClosure bool
+	ASTNode   string `json:",omitempty"` // e.g., "ForStmt", "IfStmt" hints
 }
 
 type IRPackage struct {
@@ -64,31 +69,23 @@ type IRPackage struct {
 	Functions []IRFunction
 	Types     []IRType
 	Globals   []IRField
-	ASMFiles  []string
 }
 
 type IRRoot struct {
 	Packages []IRPackage
 }
 
+var fset *token.FileSet
 var typeMap = make(map[string]bool)
 var irTypes = make([]IRType, 0)
 
 func registerType(t types.Type) {
-	if t == nil {
-		return
-	}
+	if t == nil { return }
 	str := t.String()
-	if typeMap[str] {
-		return
-	}
+	if typeMap[str] { return }
 	typeMap[str] = true
 
-	it := IRType{
-		Name:    str,
-		Fields:  make([]IRField, 0),
-		Methods: make([]string, 0),
-	}
+	it := IRType{Name: str, Fields: make([]IRField, 0), Methods: make([]string, 0)}
 	switch v := t.Underlying().(type) {
 	case *types.Struct:
 		it.Kind = "struct"
@@ -115,14 +112,6 @@ func registerType(t types.Type) {
 		it.Kind = "array"
 		it.Element = v.Elem().String()
 		registerType(v.Elem())
-	case *types.Chan:
-		it.Kind = "chan"
-		it.Element = v.Elem().String()
-		registerType(v.Elem())
-	case *types.Map:
-		it.Kind = "map"
-		registerType(v.Key())
-		registerType(v.Elem())
 	default:
 		it.Kind = "basic"
 	}
@@ -130,17 +119,12 @@ func registerType(t types.Type) {
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		log.Fatal("Usage: gonim-frontend <package>")
-	}
+	if len(os.Args) < 2 { log.Fatal("Usage: gonim-frontend <package>") }
 
-	cfg := &packages.Config{
-		Mode: packages.LoadAllSyntax,
-	}
+	fset = token.NewFileSet()
+	cfg := &packages.Config{Mode: packages.LoadAllSyntax, Fset: fset}
 	pkgs, err := packages.Load(cfg, os.Args[1:]...)
-	if err != nil {
-		log.Fatal(err)
-	}
+	if err != nil { log.Fatal(err) }
 
 	prog, _ := ssautil.AllPackages(pkgs, ssa.BuilderMode(0))
 	prog.Build()
@@ -148,27 +132,21 @@ func main() {
 	root := IRRoot{Packages: make([]IRPackage, 0)}
 
 	for _, p := range prog.AllPackages() {
-		if p == nil {
-			continue
-		}
-		path := p.Pkg.Path()
-		if path == "unsafe" {
-			continue
-		}
-
-		irPkg := IRPackage{
-			Name:      p.Pkg.Name(),
-			Path:      path,
-			Functions: make([]IRFunction, 0),
-			Types:     make([]IRType, 0),
-			Globals:   make([]IRField, 0),
-			ASMFiles:  make([]string, 0),
-		}
+		if p == nil { continue }
+		irPkg := IRPackage{Name: p.Pkg.Name(), Path: p.Pkg.Path(), Functions: make([]IRFunction, 0), Types: make([]IRType, 0), Globals: make([]IRField, 0)}
 
 		allFuncs := ssautil.AllFunctions(prog)
 		for fn := range allFuncs {
 			if fn.Package() == p {
-				irPkg.Functions = append(irPkg.Functions, lowerFunction(fn))
+				irFn := lowerFunction(fn)
+				// Hybrid hint: check if this function contains specific AST structures
+				if fn.Syntax() != nil {
+					ast.Inspect(fn.Syntax(), func(n ast.Node) bool {
+						if _, ok := n.(*ast.ForStmt); ok { irFn.ASTNode = "ForStmt" }
+						return true
+					})
+				}
+				irPkg.Functions = append(irPkg.Functions, irFn)
 			}
 		}
 
@@ -191,13 +169,7 @@ func main() {
 }
 
 func lowerFunction(fn *ssa.Function) IRFunction {
-	irFn := IRFunction{
-		Name:      fn.String(),
-		Signature: fn.Signature.String(),
-		Params:    make([]string, 0),
-		Results:   make([]string, 0),
-		Blocks:    make([]IRBlock, 0),
-	}
+	irFn := IRFunction{Name: fn.String(), Signature: fn.Signature.String(), Params: make([]string, 0), Results: make([]string, 0), Blocks: make([]IRBlock, 0), IsClosure: fn.Parent() != nil}
 	for _, p := range fn.Params {
 		irFn.Params = append(irFn.Params, p.Name())
 		registerType(p.Type())
@@ -209,7 +181,6 @@ func lowerFunction(fn *ssa.Function) IRFunction {
 			registerType(res.At(i).Type())
 		}
 	}
-
 	for _, b := range fn.Blocks {
 		irBlock := IRBlock{Index: b.Index, Instructions: make([]IRInstruction, 0)}
 		for _, inst := range b.Instrs {
@@ -222,104 +193,32 @@ func lowerFunction(fn *ssa.Function) IRFunction {
 
 func lowerInstruction(inst ssa.Instruction) IRInstruction {
 	kind := fmt.Sprintf("%T", inst)
-	if len(kind) > 5 {
-		kind = kind[5:]
-	}
-	ir := IRInstruction{Kind: kind, Args: make([]string, 0)}
-
+	if len(kind) > 5 { kind = kind[5:] }
+	ir := IRInstruction{Kind: kind, Args: make([]string, 0), SourcePos: fset.Position(inst.Pos()).String()}
 	if val, ok := inst.(ssa.Value); ok {
 		ir.Type = val.Type().String()
 		ir.Target = val.Name()
 		registerType(val.Type())
 	}
-
 	switch v := inst.(type) {
-	case *ssa.BinOp:
-		ir.Op = v.Op.String()
-		ir.Lhs = v.X.Name()
-		ir.Rhs = v.Y.Name()
-	case *ssa.UnOp:
-		ir.Op = v.Op.String()
-		ir.X = v.X.Name()
-	case *ssa.Alloc:
-		ir.Type = v.Type().String()
-	case *ssa.Store:
-		ir.Lhs = v.Addr.Name()
-		ir.Rhs = v.Val.Name()
+	case *ssa.BinOp: ir.Op = v.Op.String(); ir.Lhs = v.X.Name(); ir.Rhs = v.Y.Name()
+	case *ssa.UnOp: ir.Op = v.Op.String(); ir.X = v.X.Name()
+	case *ssa.Alloc: ir.Type = v.Type().String()
+	case *ssa.Store: ir.Lhs = v.Addr.Name(); ir.Rhs = v.Val.Name()
 	case *ssa.Call:
 		ir.X = v.Call.Value.String()
-		for _, arg := range v.Call.Args {
-			ir.Args = append(ir.Args, arg.Name())
-		}
-		if v.Name() != "" && v.Type().String() != "()" {
-			ir.HasCallResult = true
-		}
-		if v.Call.IsInvoke() {
-			ir.IsInvoke = true
-			ir.MethodName = v.Call.Method.Name()
-		}
-	case *ssa.Defer:
-		ir.X = v.Call.Value.String()
-		for _, arg := range v.Call.Args {
-			ir.Args = append(ir.Args, arg.Name())
-		}
-		if v.Call.IsInvoke() {
-			ir.IsInvoke = true
-			ir.MethodName = v.Call.Method.Name()
-		}
-	case *ssa.Go:
-		ir.X = v.Call.Value.String()
-		for _, arg := range v.Call.Args {
-			ir.Args = append(ir.Args, arg.Name())
-		}
-		if v.Call.IsInvoke() {
-			ir.IsInvoke = true
-			ir.MethodName = v.Call.Method.Name()
-		}
+		for _, arg := range v.Call.Args { ir.Args = append(ir.Args, arg.Name()) }
+		if v.Name() != "" && v.Type().String() != "()" { ir.HasCallResult = true }
+		if v.Call.IsInvoke() { ir.IsInvoke = true; ir.MethodName = v.Call.Method.Name() }
 	case *ssa.Return:
-		for _, r := range v.Results {
-			ir.Args = append(ir.Args, r.Name())
-		}
-	case *ssa.Jump:
-		ir.Block = v.Block().Succs[0].Index
-	case *ssa.If:
-		ir.X = v.Cond.Name()
-		ir.True = v.Block().Succs[0].Index
-		ir.False = v.Block().Succs[1].Index
+		for _, r := range v.Results { ir.Args = append(ir.Args, r.Name()) }
+	case *ssa.Jump: ir.Block = v.Block().Succs[0].Index
+	case *ssa.If: ir.X = v.Cond.Name(); ir.True = v.Block().Succs[0].Index; ir.False = v.Block().Succs[1].Index
 	case *ssa.Phi:
-		for _, edge := range v.Edges {
-			ir.Args = append(ir.Args, edge.Name())
-		}
-	case *ssa.FieldAddr:
-		ir.X = v.X.Name()
-		ir.Field = v.Field
-	case *ssa.Field:
-		ir.X = v.X.Name()
-		ir.Field = v.Field
-	case *ssa.IndexAddr:
-		ir.X = v.X.Name()
-		ir.Lhs = v.Index.Name()
-	case *ssa.Index:
-		ir.X = v.X.Name()
-		ir.Lhs = v.Index.Name()
-	case *ssa.Extract:
-		ir.X = v.Tuple.Name()
-		ir.Index = v.Index
-	case *ssa.MakeInterface:
-		ir.X = v.X.Name()
-	case *ssa.TypeAssert:
-		ir.X = v.X.Name()
-		ir.Type = v.AssertedType.String()
-		registerType(v.AssertedType)
-	case *ssa.MakeClosure:
-		ir.X = v.Fn.String()
-		for _, binding := range v.Bindings {
-			ir.Args = append(ir.Args, binding.Name())
-		}
-	case *ssa.Select:
-		for _, state := range v.States {
-			ir.Args = append(ir.Args, state.Chan.Name())
-		}
+		for _, edge := range v.Edges { ir.Args = append(ir.Args, edge.Name()) }
+	case *ssa.FieldAddr: ir.X = v.X.Name(); ir.Field = v.Field
+	case *ssa.IndexAddr: ir.X = v.X.Name(); ir.Lhs = v.Index.Name()
+	case *ssa.Extract: ir.X = v.Tuple.Name(); ir.Index = v.Index
 	}
 	return ir
 }
