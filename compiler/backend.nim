@@ -12,6 +12,7 @@ type
     Methods: seq[string]
     Element: string
     Key: string
+    Len: int64
 
   IRInstruction = object
     Kind: string
@@ -31,6 +32,7 @@ type
     IsInvoke: bool
     Index: int
     Field: int
+    CommaOk: bool
 
   IRBlock = object
     Index: int
@@ -50,11 +52,11 @@ type
     Functions: seq[IRFunction]
     Types: seq[IRType]
     Globals: seq[IRField]
+    Constants: seq[IRField]
 
   IRRoot = object
     Packages: seq[IRPackage]
 
-var globalTypes = initTable[string, IRType]()
 var currentPkgPrefix = ""
 
 proc sanitize(name: string): string =
@@ -94,6 +96,8 @@ proc generateTypes(types: seq[IRType]): string =
       for i, f in t.Fields: result.add "    f" & $i & "*: " & mapType(f.Type) & " # " & f.Name & "\n"
     elif t.Kind == "interface":
       result.add "  " & sName & "* = GoIface\n"
+    elif t.Kind == "array":
+      result.add "  " & sName & "* = array[" & $t.Len & ", " & mapType(t.Element) & "]\n"
   if result == "type\n": return ""
   result.add "\n"
 
@@ -110,7 +114,6 @@ proc generateFunction(fn: IRFunction): string =
   if sig == "": return ""
   var res = sig & " ="
 
-  # IDIOMATIC RECONSTRUCTION PASS
   if fn.Blocks.len <= 1:
     res.add "\n"
     if fn.Blocks.len == 1:
@@ -128,10 +131,10 @@ proc generateFunction(fn: IRFunction): string =
           else: res.add "  return\n"
         of "Alloc": res.add "  var " & sanitize(inst.Target) & ": " & mapType(inst.Type) & "\n"
         of "Store": res.add "  " & sanitize(inst.Lhs) & "[] = " & sanitize(inst.Rhs) & "\n"
+        of "UnOp": res.add "  let " & sanitize(inst.Target) & " = " & inst.Op & sanitize(inst.X) & "\n"
         else: discard
     return res
 
-  # Fallback to structured control flow for loops/branches
   res.add "\n  var nextBlock = 0\n  while true:\n    case nextBlock:\n"
   for b in fn.Blocks:
     res.add "    of " & $b.Index & ":\n"
@@ -155,6 +158,17 @@ proc generateFunction(fn: IRFunction): string =
       of "Phi": res.add "      let " & sanitize(inst.Target) & " = " & sanitize(inst.Args[0]) & "\n"
       of "Alloc": res.add "      var " & sanitize(inst.Target) & ": " & mapType(inst.Type) & "\n"
       of "Store": res.add "      " & sanitize(inst.Lhs) & "[] = " & sanitize(inst.Rhs) & "\n"
+      of "FieldAddr": res.add "      let " & sanitize(inst.Target) & " = addr " & sanitize(inst.X) & ".f" & $inst.Field & "\n"
+      of "IndexAddr": res.add "      let " & sanitize(inst.Target) & " = addr " & sanitize(inst.X) & "[" & sanitize(inst.Lhs) & "]\n"
+      of "Extract": res.add "      let " & sanitize(inst.Target) & " = " & sanitize(inst.X) & "[" & $inst.Index & "]\n"
+      of "MakeInterface": res.add "      let " & sanitize(inst.Target) & " = bindInterface(" & sanitize(inst.X) & ")\n"
+      of "Defer": res.add "      pushDefer(proc() = discard " & sanitize(inst.X) & "(" & inst.Args.map(sanitize).join(", ") & "))\n"
+      of "Go": res.add "      spawn " & sanitize(inst.X) & "(" & inst.Args.map(sanitize).join(", ") & ")\n"
+      of "Panic": res.add "      panic(" & sanitize(inst.X) & ")\n"
+      of "MakeMap": res.add "      let " & sanitize(inst.Target) & " = makeMap[" & mapType(inst.Type) & "]()\n"
+      of "MakeChan": res.add "      let " & sanitize(inst.Target) & " = makeChan[" & mapType(inst.Type) & "]()\n"
+      of "Send": res.add "      send(" & sanitize(inst.X) & ", " & sanitize(inst.Args[0]) & ")\n"
+      of "MapUpdate": res.add "      " & sanitize(inst.X) & "[" & sanitize(inst.Lhs) & "] = " & sanitize(inst.Rhs) & "\n"
       else: discard
   res.add "    else: break\n"
   return res
@@ -173,6 +187,8 @@ proc parseIR(data: string): IRRoot =
         it.Kind = jt["Kind"].getStr
         if jt.hasKey("Fields"):
           for jf in jt["Fields"]: it.Fields.add IRField(Name: jf["Name"].getStr, Type: jf["Type"].getStr)
+        if jt.hasKey("Len"): it.Len = jt["Len"].getBiggestInt
+        if jt.hasKey("Element"): it.Element = jt["Element"].getStr
         pkg.Types.add it
     if jp.hasKey("Functions"):
       for jf in jp["Functions"]:
@@ -207,20 +223,35 @@ proc parseIR(data: string): IRRoot =
         pkg.Functions.add fn
     if jp.hasKey("Globals"):
       for jg in jp["Globals"]: pkg.Globals.add IRField(Name: jg["Name"].getStr, Type: jg["Type"].getStr)
+    if jp.hasKey("Constants"):
+      for jc in jp["Constants"]: pkg.Constants.add IRField(Name: jc["Name"].getStr, Type: jc["Type"].getStr)
     result.Packages.add pkg
 
 proc main() =
   let data = stdin.readAll()
   if data.strip() == "": return
   let root = parseIR(data)
-  echo "import runtime/builtin, runtime/stdlib_mapping"
+  echo "import runtime/builtin, runtime/stdlib_mapping, threadpool"
+
+  # Global Pass
   for pkg in root.Packages:
-    currentPkgPrefix = pkg.Name.replace("-", "_")
     echo generateTypes(pkg.Types)
+    if pkg.Constants.len > 0:
+      echo "const"
+      for c in pkg.Constants: echo "  " & sanitize(c.Name) & "* = " & mapType(c.Type) # Simplified
+    if pkg.Globals.len > 0:
+      echo "var"
+      for g in pkg.Globals: echo "  " & sanitize(g.Name) & "*: " & mapType(g.Type)
     for fn in pkg.Functions:
       let sig = generateSignature(fn)
       if sig != "": echo sig & " # Forward"
+
+  # Implementation Pass
+  for pkg in root.Packages:
+    currentPkgPrefix = pkg.Name.replace("-", "_")
     for fn in pkg.Functions:
       let code = generateFunction(fn)
       if code != "": echo code
+
 main()
+echo "\nmain_main()"

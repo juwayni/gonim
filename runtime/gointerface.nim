@@ -20,33 +20,11 @@ macro implements*(T: typedesc, methods: static openArray[string]): bool =
     let methodName = ident(m)
     checks.add quote do:
       static:
-        when not compiles(decltype(`T`.`methodName`)):
+        when not compiles(block: (var x: `T`; x.`methodName`())):
           error("Type " & $`T` & " does not implement method " & `m`)
+  result = quote do: true
 
-  result = quote do:
-    true
-
-macro generateVTable*(T: typedesc, methods: static openArray[string]): untyped =
-  var structFields = newNimNode(nnkRecList)
-  for m in methods:
-    let methodName = ident(m)
-    structFields.add newIdentDefs(methodName, parseExpr("proc(p: pointer) {.nimcall.}"))
-
-  let vtableType = newTree(nnkTypeSection,
-    newTree(nnkTypeDef,
-      ident("VTable"),
-      newEmptyNode(),
-      newTree(nnkObjectTy, newEmptyNode(), newEmptyNode(), structFields)
-    )
-  )
-
-  result = newStmtList(vtableType)
-  result.add quote do:
-    var vt {.global.}: VTable
-    addr vt
-
-template bindInterface*(obj: any, T: typedesc, methods: static openArray[string]): GoIface =
+template createInterface*(obj: any, T: typedesc): GoIface =
   var desc {.global.}: GoTypeDesc
   desc.name = $T
-  desc.vtable = generateVTable(T, methods)
   GoIface(typeinfo: addr desc, data: cast[pointer](addr obj))

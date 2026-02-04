@@ -1,6 +1,6 @@
 # runtime/builtin.nim
 import goslice, gointerface
-import tables, strutils, macros
+import tables, strutils, macros, std/channels
 
 export goslice, gointerface
 
@@ -9,31 +9,17 @@ type
     data*: ptr UncheckedArray[byte]
     len*: int
 
-  GoMap*[K, V] = ref Table[K, V]
+proc `=destroy`*(s: GoString) =
+  if s.data != nil:
+    deallocShared(s.data)
 
-  GoChan*[T] = ref object
-    dummy: int
-
-  GoError* = GoIface
-
-# --- Builtin Functions ---
-
-func len*(s: GoString): int = s.len
-func len*[T](s: GoSlice[T]): int = s.len
-func cap*[T](s: GoSlice[T]): int = s.cap
-
-proc makeMap*[K, V](): GoMap[K, V] =
-  new(result)
-  result[] = initTable[K, V]()
-
-proc panic*(msg: string) =
-  raise newException(CatchableError, "panic: " & msg)
-
-proc println*(args: varargs[string, `$`]) =
-  for i, arg in args:
-    if i > 0: stdout.write " "
-    stdout.write arg
-  stdout.write "\n"
+proc `=copy`*(dest: var GoString, src: GoString) =
+  if dest.data == src.data: return
+  `=destroy`(dest)
+  dest.len = src.len
+  if src.data != nil:
+    dest.data = cast[ptr UncheckedArray[byte]](allocShared(src.len))
+    copyMem(dest.data, src.data, src.len)
 
 proc makeGoString*(s: string): GoString =
   result.len = s.len
@@ -49,22 +35,51 @@ proc `$`*(s: GoString): string =
 proc `+`*(a, b: GoString): GoString =
   return makeGoString($a & $b)
 
-# --- Interface Support ---
+# --- GoMap ---
+type
+  GoMap*[K, V] = ref Table[K, V]
 
+proc makeMap*[K, V](): GoMap[K, V] =
+  new(result)
+  result[] = initTable[K, V]()
+
+# --- GoChan ---
+type
+  GoChan*[T] = ref object
+    chanObj: Channel[T]
+
+proc makeChan*[T](size: int = 0): GoChan[T] =
+  new(result)
+  result.chanObj.open(size)
+
+proc send*[T](c: GoChan[T], val: T) =
+  c.chanObj.send(val)
+
+proc recv*[T](c: GoChan[T]): T =
+  return c.chanObj.recv()
+
+# --- Builtin Functions ---
+func len*(s: GoString): int = s.len
+func len*[T](s: GoSlice[T]): int = s.len
+func cap*[T](s: GoSlice[T]): int = s.cap
+
+proc panic*(msg: any) =
+  raise newException(CatchableError, "panic: " & $msg)
+
+proc println*(args: varargs[string, `$`]) =
+  for i, arg in args:
+    if i > 0: stdout.write " "
+    stdout.write arg
+  stdout.write "\n"
+
+# --- Interface Support ---
 proc bindInterface*[T](obj: T): GoIface =
-  var desc {.global.}: GoTypeDesc
-  desc.name = $T
-  return GoIface(typeinfo: addr desc, data: cast[pointer](addr obj))
+  return createInterface(obj, T)
 
 macro invokeInterface*(iface: GoIface, methodName: static string, args: varargs[untyped]): untyped =
-  ## Production dispatch uses the vtable.
-  ## For this demo, we'll return a placeholder.
-  result = quote do:
-    # VTable lookup logic would be here
-    makeGoString("Hello, my name is Jules") # Hardcoded for complex.go demo parity
+  discard
 
 # --- Defer Stack ---
-
 var deferStack {.threadvar.}: seq[proc() {.nimcall.}]
 
 proc pushDefer*(p: proc() {.nimcall.}) =

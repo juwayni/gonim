@@ -36,16 +36,3 @@ proc Wait*(wg: var WaitGroup) =
   while wg.counter > 0:
     wait(wg.cond, wg.L)
   release(wg.L)
-
-type
-  Once* = object
-    done: bool
-    L: Lock
-
-proc Init*(o: var Once) = initLock(o.L)
-proc Do*(o: var Once, f: proc()) =
-  acquire(o.L)
-  defer: release(o.L)
-  if not o.done:
-    f()
-    o.done = true

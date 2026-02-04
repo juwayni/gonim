@@ -11,3 +11,7 @@ proc Printf*(format: string, args: varargs[string, `$`]) =
 
 proc Sprintf*(format: string, args: varargs[string, `$`]): string =
   format % args
+
+proc Errorf*(format: string, args: varargs[string, `$`]): GoError =
+  # return errors.New(Sprintf(format, args))
+  discard
